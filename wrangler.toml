@@ -1,0 +1,9 @@
+name = "stock-divergence-analyzer"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+[env.production]
+name = "stock-divergence-analyzer-prod"
+
+[env.staging]
+name = "stock-divergence-analyzer-staging"
