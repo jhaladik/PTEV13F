@@ -11,14 +11,27 @@ const CACHE_DURATION = 3600; // 1 hour
  */
 export default {
   async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    // Try to serve static assets first (HTML, CSS, JS, etc.)
+    if (env.ASSETS) {
+      try {
+        const assetResponse = await env.ASSETS.fetch(request);
+        if (assetResponse.status !== 404) {
+          return assetResponse;
+        }
+      } catch (e) {
+        // Asset not found, continue to API routes
+      }
+    }
+
     // Handle CORS preflight
     if (request.method === 'OPTIONS') {
       return handleCORS();
     }
 
     try {
-      const url = new URL(request.url);
-      const path = url.pathname;
 
       // Route handling
       if (path === '/analyze' || path === '/analyze/') {
@@ -37,7 +50,7 @@ export default {
         }
 
         // Fetch and analyze data
-        const analysis = await analyzeStock(symbol);
+        const analysis = await analyzeStock(symbol, env);
 
         // Store in cache
         await setCache(cacheKey, analysis, CACHE_DURATION, env);
@@ -49,17 +62,22 @@ export default {
         return handleBatchAnalysis(request, env);
       }
 
-      // Default route - API info
-      return jsonResponse({
-        name: 'Stock Divergence Analyzer API',
-        version: '1.0.0',
-        endpoints: {
-          analyze: '/analyze?symbol=TICKER - Analyze single stock',
-          batch: '/batch (POST) - Analyze multiple stocks'
-        },
-        dataSources: ['Yahoo Finance', 'SEC EDGAR', 'FINRA'],
-        example: '/analyze?symbol=AKBA'
-      });
+      // API info route
+      if (path === '/api' || path === '/api/') {
+        return jsonResponse({
+          name: 'Stock Divergence Analyzer API',
+          version: '1.0.0',
+          endpoints: {
+            analyze: '/analyze?symbol=TICKER - Analyze single stock',
+            batch: '/batch (POST) - Analyze multiple stocks'
+          },
+          dataSources: ['Yahoo Finance', 'SEC EDGAR', 'FINRA'],
+          example: '/analyze?symbol=AKBA'
+        });
+      }
+
+      // 404 for unknown routes
+      return jsonResponse({ error: 'Not found' }, 404);
 
     } catch (error) {
       console.error('Worker error:', error);
@@ -74,18 +92,36 @@ export default {
 /**
  * Analyze a single stock
  */
-async function analyzeStock(symbol) {
+async function analyzeStock(symbol, env) {
   const startTime = Date.now();
 
   try {
-    // Fetch all data in parallel
-    const [priceData, institutionalData] = await Promise.all([
+    // Fetch all data in parallel from multiple sources
+    const [yahooData, finnhubData, institutionalData] = await Promise.all([
       getYahooData(symbol),
-      getSECData(symbol).catch(err => {
-        console.warn(`SEC data unavailable for ${symbol}:`, err.message);
+      getFinnhubData(symbol, env).catch(err => {
+        console.warn(`Finnhub data unavailable for ${symbol}:`, err.message);
+        return null;
+      }),
+      getAlphaVantageData(symbol, env).catch(err => {
+        console.warn(`Alpha Vantage data unavailable for ${symbol}:`, err.message);
         return null;
       })
     ]);
+
+    // Merge data from Yahoo and Finnhub (Finnhub takes priority for fundamentals)
+    const priceData = {
+      currentPrice: yahooData.currentPrice,
+      price90dChange: yahooData.price90dChange,
+      price90dChangePct: yahooData.price90dChangePct,
+      marketCap: finnhubData?.marketCap || yahooData.marketCap || 0,
+      enterpriseValue: finnhubData?.enterpriseValue || yahooData.enterpriseValue || 0,
+      revenue: yahooData.revenue,
+      evToRevenue: finnhubData?.evToRevenue || yahooData.evToRevenue,
+      peRatio: finnhubData?.peRatio || yahooData.peRatio,
+      priceToSales: finnhubData?.priceToSales || yahooData.priceToSales,
+      priceToBook: finnhubData?.priceToBook || yahooData.priceToBook
+    };
 
     // Calculate divergence score
     const score = calculateDivergenceScore(priceData, institutionalData);
@@ -98,7 +134,8 @@ async function analyzeStock(symbol) {
         price: {
           current: priceData.currentPrice,
           change90d: priceData.price90dChange,
-          change90dPct: priceData.price90dChangePct
+          change90dPct: priceData.price90dChangePct,
+          history: yahooData.priceHistory || []
         },
         valuation: {
           marketCap: priceData.marketCap,
@@ -110,6 +147,7 @@ async function analyzeStock(symbol) {
         },
         institutional: institutionalData ? {
           ownership: institutionalData.ownershipPercent,
+          insiderOwnership: institutionalData.insiderOwnership,
           quarterlyChange: institutionalData.quarterlyChange,
           topHolders: institutionalData.topHolders
         } : null
@@ -124,66 +162,138 @@ async function analyzeStock(symbol) {
 }
 
 /**
+ * Fetch fundamental data from Finnhub
+ */
+async function getFinnhubData(symbol, env) {
+  const apiKey = env?.FINNHUB_API_KEY;
+
+  if (!apiKey) {
+    // Return null if no API key configured
+    return null;
+  }
+
+  try {
+    // Fetch company metrics from Finnhub
+    const metricsUrl = `https://finnhub.io/api/v1/stock/metric?symbol=${symbol}&metric=all&token=${apiKey}`;
+    const metricsResp = await fetch(metricsUrl);
+
+    if (!metricsResp.ok) {
+      throw new Error(`Finnhub API error: ${metricsResp.status}`);
+    }
+
+    const metricsData = await metricsResp.json();
+
+    if (metricsData.error) {
+      throw new Error(metricsData.error);
+    }
+
+    const metric = metricsData.metric || {};
+
+    return {
+      marketCap: metric.marketCapitalization ? metric.marketCapitalization * 1000000 : null,
+      enterpriseValue: metric.enterpriseValue ? metric.enterpriseValue * 1000000 : null,
+      peRatio: metric.peBasicExclExtraTTM || metric.peTTM || null,
+      priceToBook: metric.pbAnnual || metric.pbQuarterly || null,
+      priceToSales: metric.psAnnual || metric.psTTM || null,
+      evToRevenue: metric.enterpriseValueOverRevenueTTM || null
+    };
+
+  } catch (error) {
+    console.warn(`Finnhub data fetch failed for ${symbol}:`, error.message);
+    return null;
+  }
+}
+
+/**
  * Fetch data from Yahoo Finance
  */
 async function getYahooData(symbol) {
   try {
-    // Fetch quote summary
-    const summaryUrl = `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${symbol}?modules=price,defaultKeyStatistics,financialData,summaryDetail`;
-    const summaryResp = await fetch(summaryUrl, {
+    // Fetch price data and 90-day history from Yahoo Finance chart API (still works)
+    const chartUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?range=3mo&interval=1d`;
+    const chartResp = await fetch(chartUrl, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
       }
     });
 
-    if (!summaryResp.ok) {
-      throw new Error(`Yahoo Finance API error: ${summaryResp.status}`);
+    if (!chartResp.ok) {
+      throw new Error(`Yahoo Finance API error: ${chartResp.status}`);
     }
 
-    const summaryData = await summaryResp.json();
-    const result = summaryData.quoteSummary?.result?.[0];
+    const chartData = await chartResp.json();
+    const result = chartData.chart?.result?.[0];
 
     if (!result) {
       throw new Error('Invalid symbol or no data available');
     }
 
-    // Fetch historical prices for 90-day change
-    const histUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?range=3mo&interval=1d`;
-    const histResp = await fetch(histUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      }
-    });
+    const meta = result.meta;
+    const prices = result.indicators?.quote?.[0]?.close?.filter(p => p !== null) || [];
+    const timestamps = result.timestamp || [];
 
+    // Calculate 90-day price change
     let price90dChange = null;
     let price90dChangePct = null;
 
-    if (histResp.ok) {
-      const histData = await histResp.json();
-      const prices = histData.chart?.result?.[0]?.indicators?.quote?.[0]?.close?.filter(p => p !== null);
-
-      if (prices && prices.length >= 2) {
-        const oldPrice = prices[0];
-        const newPrice = prices[prices.length - 1];
-        price90dChange = newPrice - oldPrice;
-        price90dChangePct = (price90dChange / oldPrice) * 100;
-      }
+    if (prices.length >= 2) {
+      const oldPrice = prices[0];
+      const newPrice = prices[prices.length - 1];
+      price90dChange = newPrice - oldPrice;
+      price90dChangePct = (price90dChange / oldPrice) * 100;
     }
 
-    // Extract data with safe navigation
-    const price = result.price || {};
-    const stats = result.defaultKeyStatistics || {};
-    const financials = result.financialData || {};
-    const summary = result.summaryDetail || {};
+    // Prepare historical data for charting (combine timestamps and prices)
+    const priceHistory = timestamps.slice(0, prices.length).map((timestamp, index) => ({
+      date: new Date(timestamp * 1000).toISOString().split('T')[0], // Convert to YYYY-MM-DD
+      price: prices[index] ? parseFloat(prices[index].toFixed(2)) : null
+    })).filter(item => item.price !== null);
 
-    const currentPrice = price.regularMarketPrice?.raw || 0;
-    const marketCap = price.marketCap?.raw || 0;
-    const enterpriseValue = stats.enterpriseValue?.raw || financials.enterpriseValue?.raw || 0;
-    const revenue = financials.totalRevenue?.raw || 0;
-    const evToRevenue = revenue > 0 ? enterpriseValue / revenue : null;
-    const peRatio = summary.trailingPE?.raw || null;
-    const priceToSales = summary.priceToSalesTrailing12Months?.raw || null;
-    const priceToBook = stats.priceToBook?.raw || null;
+    // Extract basic data from metadata
+    const currentPrice = meta.regularMarketPrice || 0;
+    const marketCap = meta.marketCap || 0;
+
+    // Use Yahoo Finance's v6 endpoint for basic stats (sometimes works without auth)
+    let peRatio = null;
+    let priceToBook = null;
+    let priceToSales = null;
+    let evToRevenue = null;
+    let enterpriseValue = marketCap; // Fallback to market cap
+    let revenue = 0;
+
+    try {
+      const statsUrl = `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${symbol}?modules=defaultKeyStatistics,financialData`;
+      const statsResp = await fetch(statsUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': '*/*',
+          'Accept-Language': 'en-US,en;q=0.5',
+          'Referer': `https://finance.yahoo.com/quote/${symbol}`
+        }
+      });
+
+      if (statsResp.ok) {
+        const statsData = await statsResp.json();
+        const stats = statsData.quoteSummary?.result?.[0]?.defaultKeyStatistics || {};
+        const financials = statsData.quoteSummary?.result?.[0]?.financialData || {};
+
+        peRatio = stats.trailingPE?.raw || financials.currentPrice?.raw / (financials.trailingEps?.raw || 1) || null;
+        priceToBook = stats.priceToBook?.raw || null;
+        enterpriseValue = stats.enterpriseValue?.raw || financials.enterpriseValue?.raw || marketCap;
+        revenue = financials.totalRevenue?.raw || 0;
+
+        if (revenue && enterpriseValue) {
+          evToRevenue = enterpriseValue / revenue;
+        }
+
+        if (financials.revenuePerShare?.raw && currentPrice) {
+          priceToSales = currentPrice / financials.revenuePerShare?.raw;
+        }
+      }
+    } catch (e) {
+      // Stats API failed, continue with limited data
+      console.warn('Failed to fetch detailed stats:', e.message);
+    }
 
     return {
       currentPrice,
@@ -195,7 +305,8 @@ async function getYahooData(symbol) {
       priceToSales,
       priceToBook,
       price90dChange,
-      price90dChangePct
+      price90dChangePct,
+      priceHistory
     };
 
   } catch (error) {
@@ -204,60 +315,102 @@ async function getYahooData(symbol) {
 }
 
 /**
- * Fetch institutional ownership from SEC
+ * Fetch institutional ownership from Yahoo Finance (HTML fallback)
  */
-async function getSECData(symbol) {
+async function getYahooInstitutionalData(symbol) {
   try {
-    // Get CIK (Central Index Key) for the symbol
-    const tickerUrl = 'https://www.sec.gov/files/company_tickers.json';
-    const tickerResp = await fetch(tickerUrl, {
+    const statsUrl = `https://finance.yahoo.com/quote/${symbol}/key-statistics`;
+    const response = await fetch(statsUrl, {
       headers: {
-        'User-Agent': 'Stock Analyzer research@example.com'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
       }
     });
 
-    if (!tickerResp.ok) {
-      throw new Error('Failed to fetch ticker data');
+    if (!response.ok) {
+      throw new Error(`Yahoo Finance HTML fetch error: ${response.status}`);
     }
 
-    const tickers = await tickerResp.json();
-    const company = Object.values(tickers).find(
-      t => t.ticker.toUpperCase() === symbol.toUpperCase()
-    );
+    const html = await response.text();
 
-    if (!company) {
-      return null; // Symbol not found in SEC database
+    // Parse institutional ownership percentage from HTML
+    // Looking for pattern like "% Held by Institutions" followed by the percentage
+    const institutionalMatch = html.match(/Held by Institutions[^>]*>\s*([0-9.]+)%/i) ||
+                              html.match(/institutionsPercentHeld[^>]*>\s*([0-9.]+)%/i);
+
+    const insiderMatch = html.match(/Held by Insiders[^>]*>\s*([0-9.]+)%/i) ||
+                        html.match(/insidersPercentHeld[^>]*>\s*([0-9.]+)%/i);
+
+    const institutionalOwnership = institutionalMatch ? parseFloat(institutionalMatch[1]) : null;
+    const insiderOwnership = insiderMatch ? parseFloat(insiderMatch[1]) : null;
+
+    if (institutionalOwnership === null && insiderOwnership === null) {
+      throw new Error('Could not parse ownership data from HTML');
     }
 
-    const cik = String(company.cik_str).padStart(10, '0');
-
-    // Fetch recent 13F filings
-    const submissionsUrl = `https://data.sec.gov/submissions/CIK${cik}.json`;
-    const submissionsResp = await fetch(submissionsUrl, {
-      headers: {
-        'User-Agent': 'Stock Analyzer research@example.com'
-      }
-    });
-
-    if (!submissionsResp.ok) {
-      throw new Error('Failed to fetch SEC submissions');
-    }
-
-    const submissions = await submissionsResp.json();
-
-    // Parse institutional ownership data (simplified)
-    // In production, you'd parse actual 13F-HR filings
     return {
-      cik,
-      companyName: company.title,
-      ownershipPercent: null, // Would need to parse 13F filings
+      ownershipPercent: institutionalOwnership,
+      insiderOwnership: insiderOwnership,
+      sharesOutstanding: null,
       quarterlyChange: null,
-      topHolders: []
+      topHolders: [],
+      source: 'Yahoo Finance HTML'
     };
 
   } catch (error) {
-    throw new Error(`SEC data fetch failed: ${error.message}`);
+    console.warn(`Yahoo Finance HTML parse failed for ${symbol}:`, error.message);
+    return null;
   }
+}
+
+/**
+ * Fetch institutional ownership from Alpha Vantage (primary) with Yahoo Finance fallback
+ */
+async function getAlphaVantageData(symbol, env) {
+  const apiKey = env?.ALPHAVANTAGE_API_KEY;
+
+  // Try Alpha Vantage first if API key is available
+  if (apiKey) {
+    try {
+      const overviewUrl = `https://www.alphavantage.co/query?function=OVERVIEW&symbol=${symbol}&apikey=${apiKey}`;
+      const response = await fetch(overviewUrl);
+
+      if (!response.ok) {
+        throw new Error(`Alpha Vantage API error: ${response.status}`);
+      }
+
+      const data = await response.json();
+
+      // Check for rate limit or error
+      if (data['Note'] && data['Note'].includes('rate limit')) {
+        console.warn(`Alpha Vantage rate limit reached, falling back to Yahoo Finance for ${symbol}`);
+        return await getYahooInstitutionalData(symbol);
+      }
+
+      if (data['Error Message']) {
+        throw new Error(data['Error Message']);
+      }
+
+      const institutionalOwnership = parseFloat(data.PercentInstitutions) || null;
+      const insiderOwnership = parseFloat(data.PercentInsiders) || null;
+      const sharesOutstanding = parseFloat(data.SharesOutstanding) || null;
+
+      return {
+        ownershipPercent: institutionalOwnership,
+        insiderOwnership: insiderOwnership,
+        sharesOutstanding: sharesOutstanding,
+        quarterlyChange: null,
+        topHolders: [],
+        source: 'Alpha Vantage'
+      };
+
+    } catch (error) {
+      console.warn(`Alpha Vantage failed for ${symbol}, trying Yahoo Finance fallback:`, error.message);
+      return await getYahooInstitutionalData(symbol);
+    }
+  }
+
+  // No API key, use Yahoo Finance HTML parsing
+  return await getYahooInstitutionalData(symbol);
 }
 
 /**
@@ -297,10 +450,21 @@ function calculateDivergenceScore(priceData, institutionalData) {
   }
 
   // Institutional component (30 points)
-  if (institutionalData?.quarterlyChange !== null) {
-    if (institutionalData.quarterlyChange > 10) score += 30;
-    else if (institutionalData.quarterlyChange > 5) score += 20;
-    else if (institutionalData.quarterlyChange > 0) score += 10;
+  // High institutional ownership + price decline = smart money holding through pullback (bullish)
+  if (institutionalData && institutionalData.ownershipPercent !== null && institutionalData.ownershipPercent !== undefined) {
+    const ownership = institutionalData.ownershipPercent;
+    const priceDown = priceData.price90dChangePct < 0;
+
+    // Reward high institutional ownership, especially when price is down
+    if (ownership >= 70) {
+      score += priceDown ? 30 : 20; // Max points if institutions holding during decline
+    } else if (ownership >= 50) {
+      score += priceDown ? 25 : 15;
+    } else if (ownership >= 40) {
+      score += priceDown ? 20 : 10;
+    } else if (ownership >= 30) {
+      score += priceDown ? 15 : 5;
+    }
   }
 
   return Math.min(Math.round(score), 100);
@@ -343,6 +507,24 @@ function generateSignals(priceData, institutionalData, score) {
     });
   }
 
+  // Institutional ownership signal
+  if (institutionalData && institutionalData.ownershipPercent !== null && institutionalData.ownershipPercent !== undefined) {
+    const ownership = institutionalData.ownershipPercent;
+    const priceDown = priceData.price90dChangePct < -10;
+
+    if (ownership >= 50 && priceDown) {
+      signals.push({
+        type: 'INSTITUTIONAL',
+        reason: `${ownership.toFixed(1)}% institutional ownership - smart money holding through ${Math.abs(priceData.price90dChangePct).toFixed(1)}% decline`
+      });
+    } else if (ownership >= 60) {
+      signals.push({
+        type: 'INSTITUTIONAL',
+        reason: `High institutional ownership (${ownership.toFixed(1)}%)`
+      });
+    }
+  }
+
   return signals;
 }
 
@@ -368,7 +550,7 @@ async function handleBatchAnalysis(request, env) {
 
     // Analyze all symbols in parallel
     const results = await Promise.allSettled(
-      symbols.map(symbol => analyzeStock(symbol.toUpperCase()))
+      symbols.map(symbol => analyzeStock(symbol.toUpperCase(), env))
     );
 
     const response = {

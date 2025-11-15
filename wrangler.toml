@@ -2,6 +2,15 @@ name = "stock-divergence-analyzer"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
 
+# Serve static assets (HTML frontend)
+assets = { directory = "./public" }
+
+# D1 Database for historical data
+[[d1_databases]]
+binding = "DB"
+database_name = "stock-data-db"
+database_id = "71d4e27a-4876-4b67-bfb9-67f68427c10f"
+
 [env.production]
 name = "stock-divergence-analyzer-prod"
 

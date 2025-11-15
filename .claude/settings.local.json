@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl:*)",
+      "Bash(wrangler whoami:*)",
+      "Bash(npm run deploy:*)",
+      "Bash(cat:*)",
+      "Bash(wrangler secret:*)",
+      "Bash(.dev.vars)",
+      "WebSearch",
+      "WebFetch(domain:iexcloud.io)",
+      "WebFetch(domain:polygon.io)",
+      "WebFetch(domain:massive.com)",
+      "Bash(wrangler d1 create:*)",
+      "Bash(wrangler d1 execute:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
